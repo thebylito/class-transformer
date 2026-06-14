@@ -74,8 +74,8 @@ export class TransformOperationExecutor {
   // -------------------------------------------------------------------------
 
   transform(
-    source: Record<string, any> | Record<string, any>[] | any,
-    value: Record<string, any> | Record<string, any>[] | any,
+    source: any,
+    value: any,
     targetType: Function | TypeMetadata | undefined,
     arrayType: Function | undefined,
     isMap: boolean | undefined,
@@ -260,7 +260,7 @@ export class TransformOperationExecutor {
               // ignores it, so we skip an object allocation per property per object.
               newType =
                 metadata.typeFunction.length === 0
-                  ? (metadata.typeFunction as () => Function)()
+                  ? metadata.typeFunction()
                   : metadata.typeFunction({ newObject: newValue, object: value, property: propertyName });
             } else {
               newType = metadata.reflectedType;
@@ -279,7 +279,11 @@ export class TransformOperationExecutor {
                       return subType.name === subValue[discriminator.property];
                     }
                   });
-                  type === undefined ? (type = newType) : (type = type.value);
+                  if (type === undefined) {
+                    type = newType;
+                  } else {
+                    type = type.value;
+                  }
                   if (!metadata.options.keepDiscriminatorProperty) {
                     if (subValue && subValue instanceof Object && discriminator.property in subValue) {
                       delete subValue[discriminator.property];
@@ -460,7 +464,11 @@ export class TransformOperationExecutor {
           const options: TypeHelpOptions = { newObject: newValue, object: subValue, property: undefined };
           // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
           const newType = targetType.typeFunction!(options);
-          realTargetType === undefined ? (realTargetType = newType) : (realTargetType = realTargetType.value);
+          if (realTargetType === undefined) {
+            realTargetType = newType;
+          } else {
+            realTargetType = realTargetType.value;
+          }
           if (!targetType.options.keepDiscriminatorProperty) delete subValue[discriminator.property];
         }
 

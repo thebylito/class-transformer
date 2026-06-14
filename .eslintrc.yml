@@ -4,30 +4,34 @@ plugins:
 parserOptions:
   ecmaVersion: 2018
   sourceType: module
-  project: 
+  project:
     - ./tsconfig.json
     - ./tsconfig.spec.json
 extends:
   - 'plugin:@typescript-eslint/recommended'
-  - 'plugin:@typescript-eslint/recommended-requiring-type-checking'
+  - 'plugin:@typescript-eslint/recommended-type-checked'
   - 'plugin:jest/recommended'
   - 'prettier'
 rules:
   '@typescript-eslint/explicit-member-accessibility': off
-  '@typescript-eslint/no-angle-bracket-type-assertion': off
-  '@typescript-eslint/no-parameter-properties': off
+  '@typescript-eslint/parameter-properties': off
   '@typescript-eslint/explicit-function-return-type': off
-  '@typescript-eslint/member-delimiter-style': off
   '@typescript-eslint/no-inferrable-types': off
   '@typescript-eslint/no-explicit-any': off
   '@typescript-eslint/member-ordering': 'error'
   '@typescript-eslint/no-unused-vars':
     - 'error'
     - args: 'none'
-  # TODO: Remove these and fixed issues once we merged all the current PRs. 
-  '@typescript-eslint/ban-types': off 
+      caughtErrors: 'none'
+  # `ban-types` was split into the rules below in @typescript-eslint v8; kept off to preserve the
+  # original config which disabled `ban-types` (the codebase relies on `Function`/`Object` types).
+  '@typescript-eslint/no-empty-object-type': off
+  '@typescript-eslint/no-unsafe-function-type': off
+  '@typescript-eslint/no-wrapper-object-types': off
+  # TODO: Remove these and fix the underlying issues.
   '@typescript-eslint/no-unsafe-return': off
   '@typescript-eslint/no-unsafe-assignment': off
   '@typescript-eslint/no-unsafe-call': off
   '@typescript-eslint/no-unsafe-member-access': off
+  '@typescript-eslint/no-unsafe-argument': off
   '@typescript-eslint/explicit-module-boundary-types': off

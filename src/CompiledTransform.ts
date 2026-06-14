@@ -170,7 +170,7 @@ export function getCompiledPlanPlainToClass(target: Function): CompiledPlan | nu
         // A type function that inspects its argument can return different types per
         // object; only the simple `() => T` form is safe to resolve once.
         if (typeMeta.typeFunction.length > 0) return null;
-        resolvedType = (typeMeta.typeFunction as () => Function)();
+        resolvedType = typeMeta.typeFunction();
       } else {
         resolvedType = typeMeta.reflectedType;
       }
