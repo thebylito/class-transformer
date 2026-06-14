@@ -2,5 +2,6 @@
 export interface TypeHelpOptions {
   newObject: any;
   object: Record<string, any>;
-  property: string;
+  /** The property being transformed, or `undefined` for array-level (discriminator) types. */
+  property: string | undefined;
 }

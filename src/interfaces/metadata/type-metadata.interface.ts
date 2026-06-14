@@ -18,9 +18,10 @@ export interface TypeMetadata {
 
   /**
    * The custom function provided by the user in the @Type decorator which
-   * returns the target type for the transformation.
+   * returns the target type for the transformation. Optional — omitted when the
+   * type is resolved from reflected metadata instead.
    */
-  typeFunction: (options?: TypeHelpOptions) => Function;
+  typeFunction?: (options?: TypeHelpOptions) => Function;
 
   /**
    * Options passed to the @Type operator for this property.

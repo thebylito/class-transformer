@@ -1,7 +1,15 @@
 import { defaultMetadataStorage } from './storage';
-import { ClassTransformOptions, TypeHelpOptions, TypeMetadata, TypeOptions } from './interfaces';
+import { ClassTransformOptions, TransformMetadata, TypeHelpOptions, TypeMetadata } from './interfaces';
 import { TransformationType } from './enums';
 import { getGlobal, isPromise } from './utils';
+import { getCompiledPlanPlainToClass, isCompilableOptions, runCompiledPlan } from './CompiledTransform';
+
+/**
+ * The global object reference is stable for the lifetime of the module, so we
+ * resolve it once instead of running the `typeof` probe chain on every value.
+ * The `Buffer` property is still read at use-time to honor late polyfills.
+ */
+const GLOBAL = getGlobal();
 
 function instantiateArrayType(arrayType: Function): Array<any> | Set<any> {
   const array = new (arrayType as any)();
@@ -11,6 +19,30 @@ function instantiateArrayType(arrayType: Function): Array<any> | Set<any> {
   return array;
 }
 
+/**
+ * Per-prototype cache of own property names that must NOT be overwritten when
+ * writing into a class instance — methods and getter-only accessors (any own
+ * descriptor without a setter). The set is the same for every instance of a
+ * class, so we compute it once instead of probing `getOwnPropertyDescriptor`
+ * per key per object. Keyed weakly so prototypes can still be garbage-collected.
+ */
+const nonWritableKeysCache = new WeakMap<object, Set<string>>();
+
+function getNonWritableKeys(prototype: object): Set<string> {
+  let keys = nonWritableKeysCache.get(prototype);
+  if (!keys) {
+    keys = new Set<string>();
+    for (const name of Object.getOwnPropertyNames(prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+      if (descriptor && !descriptor.set) {
+        keys.add(name);
+      }
+    }
+    nonWritableKeysCache.set(prototype, keys);
+  }
+  return keys;
+}
+
 export class TransformOperationExecutor {
   // -------------------------------------------------------------------------
   // Private Properties
@@ -18,11 +50,24 @@ export class TransformOperationExecutor {
 
   private recursionStack = new Set<Record<string, any>>();
 
+  /**
+   * Per-operation memo of the @Transform metadatas that apply to (target, key)
+   * after version/group filtering. Options are fixed for an executor instance, so
+   * an array of N same-typed objects resolves each selection once instead of N times.
+   */
+  private _transformMetadatasCache = new Map<Function, Map<string, TransformMetadata[]>>();
+
+  /** Whether the compiled PLAIN_TO_CLASS fast path is eligible for this operation. */
+  private readonly compilablePlainToClass: boolean;
+
   // -------------------------------------------------------------------------
   // Constructor
   // -------------------------------------------------------------------------
 
-  constructor(private transformationType: TransformationType, private options: ClassTransformOptions) {}
+  constructor(private transformationType: TransformationType, private options: ClassTransformOptions) {
+    this.compilablePlainToClass =
+      transformationType === TransformationType.PLAIN_TO_CLASS && isCompilableOptions(options);
+  }
 
   // -------------------------------------------------------------------------
   // Public Methods
@@ -31,9 +76,9 @@ export class TransformOperationExecutor {
   transform(
     source: Record<string, any> | Record<string, any>[] | any,
     value: Record<string, any> | Record<string, any>[] | any,
-    targetType: Function | TypeMetadata,
-    arrayType: Function,
-    isMap: boolean,
+    targetType: Function | TypeMetadata | undefined,
+    arrayType: Function | undefined,
+    isMap: boolean | undefined,
     level: number = 0
   ): any {
     if (Array.isArray(value) || value instanceof Set) {
@@ -41,63 +86,22 @@ export class TransformOperationExecutor {
         arrayType && this.transformationType === TransformationType.PLAIN_TO_CLASS
           ? instantiateArrayType(arrayType)
           : [];
-      (value as any[]).forEach((subValue, index) => {
-        const subSource = source ? source[index] : undefined;
-        if (!this.options.enableCircularCheck || !this.isCircular(subValue)) {
-          let realTargetType;
-          if (
-            typeof targetType !== 'function' &&
-            targetType &&
-            targetType.options &&
-            targetType.options.discriminator &&
-            targetType.options.discriminator.property &&
-            targetType.options.discriminator.subTypes
-          ) {
-            if (this.transformationType === TransformationType.PLAIN_TO_CLASS) {
-              realTargetType = targetType.options.discriminator.subTypes.find(
-                subType =>
-                  subType.name === subValue[(targetType as { options: TypeOptions }).options.discriminator.property]
-              );
-              const options: TypeHelpOptions = { newObject: newValue, object: subValue, property: undefined };
-              const newType = targetType.typeFunction(options);
-              realTargetType === undefined ? (realTargetType = newType) : (realTargetType = realTargetType.value);
-              if (!targetType.options.keepDiscriminatorProperty)
-                delete subValue[targetType.options.discriminator.property];
-            }
-
-            if (this.transformationType === TransformationType.CLASS_TO_CLASS) {
-              realTargetType = subValue.constructor;
-            }
-            if (this.transformationType === TransformationType.CLASS_TO_PLAIN) {
-              subValue[targetType.options.discriminator.property] = targetType.options.discriminator.subTypes.find(
-                subType => subType.value === subValue.constructor
-              ).name;
-            }
-          } else {
-            realTargetType = targetType;
-          }
-          const value = this.transform(
-            subSource,
-            subValue,
-            realTargetType,
-            undefined,
-            subValue instanceof Map,
-            level + 1
-          );
-
-          if (newValue instanceof Set) {
-            newValue.add(value);
-          } else {
-            newValue.push(value);
-          }
-        } else if (this.transformationType === TransformationType.CLASS_TO_CLASS) {
-          if (newValue instanceof Set) {
-            newValue.add(subValue);
-          } else {
-            newValue.push(subValue);
-          }
+      // Indexed loop instead of `forEach` to avoid the per-array callback closure
+      // and keep the hot array path monomorphic. `Set.forEach` passes the element
+      // as both value and key, and `forEach` skips array holes — both preserved.
+      if (Array.isArray(value)) {
+        for (let index = 0; index < value.length; index++) {
+          if (!(index in value)) continue;
+          this.transformArrayItem(source, value[index], index, targetType, newValue, level);
         }
-      });
+      } else {
+        // value is a Set; forEach avoids `for...of` iteration, which would require
+        // --downlevelIteration on the ES5 build target. Matches the original Set
+        // semantics (the element is passed as both value and key).
+        value.forEach((subValue: any) => {
+          this.transformArrayItem(source, subValue, subValue, targetType, newValue, level);
+        });
+      }
       return newValue;
     } else if (targetType === String && !isMap) {
       if (value === null || value === undefined) return value;
@@ -114,13 +118,13 @@ export class TransformOperationExecutor {
       }
       if (value === null || value === undefined) return value;
       return new Date(value);
-    } else if (!!getGlobal().Buffer && (targetType === Buffer || value instanceof Buffer) && !isMap) {
+    } else if (!!GLOBAL.Buffer && (targetType === GLOBAL.Buffer || value instanceof GLOBAL.Buffer) && !isMap) {
       if (value === null || value === undefined) return value;
-      return Buffer.from(value);
+      return GLOBAL.Buffer.from(value);
     } else if (isPromise(value) && !isMap) {
       return new Promise((resolve, reject) => {
         value.then(
-          (data: any) => resolve(this.transform(undefined, data, targetType, undefined, undefined, level + 1)),
+          (data: any) => resolve(this.transform(undefined, data, targetType, undefined, false, level + 1)),
           reject
         );
       });
@@ -142,12 +146,22 @@ export class TransformOperationExecutor {
         }
       if (!targetType && source) targetType = source.constructor;
 
+      // Compiled fast path: PLAIN_TO_CLASS, default options, a decorated target class,
+      // and a plain (non-Map) source object. Falls back to the generic walk below for
+      // anything the compiler can't reproduce exactly (it returns a null plan).
+      if (this.compilablePlainToClass && !source && !isMap && targetType && !(value instanceof Map)) {
+        const plan = getCompiledPlanPlainToClass(targetType as Function);
+        if (plan) {
+          return runCompiledPlan(plan, this, value as Record<string, any>, level, this.options);
+        }
+      }
+
       if (this.options.enableCircularCheck) {
         // add transformed type to prevent circular references
         this.recursionStack.add(value);
       }
 
-      const keys = this.getKeys(targetType as Function, value, isMap);
+      const keys = this.getKeys(targetType as Function, value, isMap === true);
       let newValue: any = source ? source : {};
       if (
         !source &&
@@ -163,6 +177,22 @@ export class TransformOperationExecutor {
         }
       }
 
+      // @Transform metadata is the same for every key of this object, so resolve
+      // once: most classes have none, letting us skip the per-key custom-transform
+      // lookup entirely below.
+      const hasTransforms = targetType ? defaultMetadataStorage.hasTransformMetadata(targetType as Function) : false;
+
+      // When writing into a class instance, methods / getter-only accessors on the
+      // prototype must be skipped. That set is the same for every key, so resolve
+      // it once per object instead of probing a descriptor per key.
+      const nonWritableKeys =
+        (this.transformationType === TransformationType.PLAIN_TO_CLASS ||
+          this.transformationType === TransformationType.CLASS_TO_CLASS) &&
+        newValue.constructor &&
+        newValue.constructor.prototype
+          ? getNonWritableKeys(newValue.constructor.prototype)
+          : undefined;
+
       // traverse over keys
       for (const key of keys) {
         if (key === '__proto__' || key === 'constructor') {
@@ -175,7 +205,7 @@ export class TransformOperationExecutor {
         if (!this.options.ignoreDecorators && targetType) {
           if (this.transformationType === TransformationType.PLAIN_TO_CLASS) {
             const exposeMetadata = defaultMetadataStorage.findExposeMetadataByCustomName(targetType as Function, key);
-            if (exposeMetadata) {
+            if (exposeMetadata && exposeMetadata.propertyName) {
               propertyName = exposeMetadata.propertyName;
               newValueKey = exposeMetadata.propertyName;
             }
@@ -211,32 +241,48 @@ export class TransformOperationExecutor {
         }
 
         // determine a type
+        // Resolve the @Type() metadata once and reuse it both here and for the
+        // array-type lookup below, instead of querying the metadata storage twice.
+        const typeMetadata = targetType
+          ? defaultMetadataStorage.findTypeMetadata(targetType as Function, propertyName)
+          : undefined;
         let type: any = undefined,
           isSubValueMap = subValue instanceof Map;
         if (targetType && isMap) {
           type = targetType;
         } else if (targetType) {
-          const metadata = defaultMetadataStorage.findTypeMetadata(targetType as Function, propertyName);
+          const metadata = typeMetadata;
           if (metadata) {
-            const options: TypeHelpOptions = { newObject: newValue, object: value, property: propertyName };
-            const newType = metadata.typeFunction ? metadata.typeFunction(options) : metadata.reflectedType;
+            let newType: any;
+            if (metadata.typeFunction) {
+              // Only build the TypeHelpOptions argument when the type function
+              // actually declares a parameter. The common `@Type(() => Foo)` form
+              // ignores it, so we skip an object allocation per property per object.
+              newType =
+                metadata.typeFunction.length === 0
+                  ? (metadata.typeFunction as () => Function)()
+                  : metadata.typeFunction({ newObject: newValue, object: value, property: propertyName });
+            } else {
+              newType = metadata.reflectedType;
+            }
             if (
               metadata.options &&
               metadata.options.discriminator &&
               metadata.options.discriminator.property &&
               metadata.options.discriminator.subTypes
             ) {
+              const discriminator = metadata.options.discriminator;
               if (!(value[valueKey] instanceof Array)) {
                 if (this.transformationType === TransformationType.PLAIN_TO_CLASS) {
-                  type = metadata.options.discriminator.subTypes.find(subType => {
-                    if (subValue && subValue instanceof Object && metadata.options.discriminator.property in subValue) {
-                      return subType.name === subValue[metadata.options.discriminator.property];
+                  type = discriminator.subTypes.find(subType => {
+                    if (subValue && subValue instanceof Object && discriminator.property in subValue) {
+                      return subType.name === subValue[discriminator.property];
                     }
                   });
                   type === undefined ? (type = newType) : (type = type.value);
                   if (!metadata.options.keepDiscriminatorProperty) {
-                    if (subValue && subValue instanceof Object && metadata.options.discriminator.property in subValue) {
-                      delete subValue[metadata.options.discriminator.property];
+                    if (subValue && subValue instanceof Object && discriminator.property in subValue) {
+                      delete subValue[discriminator.property];
                     }
                   }
                 }
@@ -245,9 +291,11 @@ export class TransformOperationExecutor {
                 }
                 if (this.transformationType === TransformationType.CLASS_TO_PLAIN) {
                   if (subValue) {
-                    subValue[metadata.options.discriminator.property] = metadata.options.discriminator.subTypes.find(
+                    const matchedSubType = discriminator.subTypes.find(
                       subType => subType.value === subValue.constructor
-                    ).name;
+                    );
+                    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                    subValue[discriminator.property] = matchedSubType!.name;
                   }
                 }
               } else {
@@ -281,9 +329,7 @@ export class TransformOperationExecutor {
         }
 
         // if value is an array try to get its custom array type
-        const arrayType = Array.isArray(value[valueKey])
-          ? this.getReflectedType(targetType as Function, propertyName)
-          : undefined;
+        const arrayType = Array.isArray(value[valueKey]) && typeMetadata ? typeMetadata.reflectedType : undefined;
 
         // const subValueKey = TransformationType === TransformationType.PLAIN_TO_CLASS && newKeyName ? newKeyName : key;
         const subSource = source ? source[valueKey] : undefined;
@@ -293,17 +339,15 @@ export class TransformOperationExecutor {
         // if (this.transformationType === TransformationType.PLAIN_TO_CLASS && !type && subValue instanceof Object && !(subValue instanceof Date))
         //     throw new Error(`Cannot determine type for ${(targetType as any).name }.${propertyName}, did you forget to specify a @Type?`);
 
-        // if newValue is a source object that has method that match newKeyName then skip it
-        if (newValue.constructor.prototype) {
-          const descriptor = Object.getOwnPropertyDescriptor(newValue.constructor.prototype, newValueKey);
-          if (
-            (this.transformationType === TransformationType.PLAIN_TO_CLASS ||
-              this.transformationType === TransformationType.CLASS_TO_CLASS) &&
-            // eslint-disable-next-line @typescript-eslint/unbound-method
-            ((descriptor && !descriptor.set) || newValue[newValueKey] instanceof Function)
-          )
-            //  || TransformationType === TransformationType.CLASS_TO_CLASS
-            continue;
+        // if newValue is a class instance whose prototype has a method/getter matching
+        // newValueKey, skip it (don't overwrite it). The non-writable key set is resolved
+        // once per object above; the Function check stays per-key (instance dependent).
+        if (
+          nonWritableKeys &&
+          // eslint-disable-next-line @typescript-eslint/unbound-method
+          (nonWritableKeys.has(newValueKey) || newValue[newValueKey] instanceof Function)
+        ) {
+          continue;
         }
 
         if (!this.options.enableCircularCheck || !this.isCircular(subValue)) {
@@ -313,16 +357,20 @@ export class TransformOperationExecutor {
           if (this.transformationType === TransformationType.CLASS_TO_PLAIN) {
             // Get original value
             finalValue = value[transformKey];
-            // Apply custom transformation
-            finalValue = this.applyCustomTransformations(
-              finalValue,
-              targetType as Function,
-              transformKey,
-              value,
-              this.transformationType
-            );
-            // If nothing change, it means no custom transformation was applied, so use the subValue.
-            finalValue = value[transformKey] === finalValue ? subValue : finalValue;
+            // Apply custom transformation (only when the class declares any @Transform)
+            if (hasTransforms) {
+              finalValue = this.applyCustomTransformations(
+                finalValue,
+                targetType as Function,
+                transformKey,
+                value,
+                this.transformationType
+              );
+              // If nothing change, it means no custom transformation was applied, so use the subValue.
+              finalValue = value[transformKey] === finalValue ? subValue : finalValue;
+            } else {
+              finalValue = subValue;
+            }
             // Apply the default transformation
             finalValue = this.transform(subSource, finalValue, type, arrayType, isSubValueMap, level + 1);
           } else {
@@ -331,13 +379,15 @@ export class TransformOperationExecutor {
               finalValue = newValue[newValueKey];
             } else {
               finalValue = this.transform(subSource, subValue, type, arrayType, isSubValueMap, level + 1);
-              finalValue = this.applyCustomTransformations(
-                finalValue,
-                targetType as Function,
-                transformKey,
-                value,
-                this.transformationType
-              );
+              if (hasTransforms) {
+                finalValue = this.applyCustomTransformations(
+                  finalValue,
+                  targetType as Function,
+                  transformKey,
+                  value,
+                  this.transformationType
+                );
+              }
             }
           }
 
@@ -350,13 +400,15 @@ export class TransformOperationExecutor {
           }
         } else if (this.transformationType === TransformationType.CLASS_TO_CLASS) {
           let finalValue = subValue;
-          finalValue = this.applyCustomTransformations(
-            finalValue,
-            targetType as Function,
-            key,
-            value,
-            this.transformationType
-          );
+          if (hasTransforms) {
+            finalValue = this.applyCustomTransformations(
+              finalValue,
+              targetType as Function,
+              key,
+              value,
+              this.transformationType
+            );
+          }
           if (finalValue !== undefined || this.options.exposeUnsetFields) {
             if (newValue instanceof Map) {
               newValue.set(newValueKey, finalValue);
@@ -377,53 +429,132 @@ export class TransformOperationExecutor {
     }
   }
 
+  /**
+   * Transforms a single element of an array/set and appends it to `newValue`.
+   * Extracted from the array branch so the iteration can use a plain loop (no
+   * per-array closure). `index` is the array index, or — matching `Set.forEach` —
+   * the element itself when iterating a Set.
+   */
+  private transformArrayItem(
+    source: any,
+    subValue: any,
+    index: any,
+    targetType: Function | TypeMetadata | undefined,
+    newValue: Array<any> | Set<any>,
+    level: number
+  ): void {
+    const subSource = source ? source[index] : undefined;
+    if (!this.options.enableCircularCheck || !this.isCircular(subValue)) {
+      let realTargetType;
+      if (
+        typeof targetType !== 'function' &&
+        targetType &&
+        targetType.options &&
+        targetType.options.discriminator &&
+        targetType.options.discriminator.property &&
+        targetType.options.discriminator.subTypes
+      ) {
+        const discriminator = targetType.options.discriminator;
+        if (this.transformationType === TransformationType.PLAIN_TO_CLASS) {
+          realTargetType = discriminator.subTypes.find(subType => subType.name === subValue[discriminator.property]);
+          const options: TypeHelpOptions = { newObject: newValue, object: subValue, property: undefined };
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+          const newType = targetType.typeFunction!(options);
+          realTargetType === undefined ? (realTargetType = newType) : (realTargetType = realTargetType.value);
+          if (!targetType.options.keepDiscriminatorProperty) delete subValue[discriminator.property];
+        }
+
+        if (this.transformationType === TransformationType.CLASS_TO_CLASS) {
+          realTargetType = subValue.constructor;
+        }
+        if (this.transformationType === TransformationType.CLASS_TO_PLAIN) {
+          const matchedSubType = discriminator.subTypes.find(subType => subType.value === subValue.constructor);
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+          subValue[discriminator.property] = matchedSubType!.name;
+        }
+      } else {
+        realTargetType = targetType;
+      }
+      const transformed = this.transform(
+        subSource,
+        subValue,
+        realTargetType,
+        undefined,
+        subValue instanceof Map,
+        level + 1
+      );
+
+      if (newValue instanceof Set) {
+        newValue.add(transformed);
+      } else {
+        newValue.push(transformed);
+      }
+    } else if (this.transformationType === TransformationType.CLASS_TO_CLASS) {
+      if (newValue instanceof Set) {
+        newValue.add(subValue);
+      } else {
+        newValue.push(subValue);
+      }
+    }
+  }
+
   private applyCustomTransformations(
     value: any,
     target: Function,
     key: string,
     obj: any,
     transformationType: TransformationType
-  ): boolean {
-    let metadatas = defaultMetadataStorage.findTransformMetadatas(target, key, this.transformationType);
-
-    // apply versioning options
-    if (this.options.version !== undefined) {
-      metadatas = metadatas.filter(metadata => {
-        if (!metadata.options) return true;
-
-        return this.checkVersion(metadata.options.since, metadata.options.until);
-      });
+  ): any {
+    const metadatas = this.getTransformMetadatas(target, key);
+    for (let i = 0; i < metadatas.length; i++) {
+      value = metadatas[i].transformFn({ value, key, obj, type: transformationType, options: this.options });
     }
-
-    // apply grouping options
-    if (this.options.groups && this.options.groups.length) {
-      metadatas = metadatas.filter(metadata => {
-        if (!metadata.options) return true;
-
-        return this.checkGroups(metadata.options.groups);
-      });
-    } else {
-      metadatas = metadatas.filter(metadata => {
-        return !metadata.options || !metadata.options.groups || !metadata.options.groups.length;
-      });
-    }
-
-    metadatas.forEach(metadata => {
-      value = metadata.transformFn({ value, key, obj, type: transformationType, options: this.options });
-    });
-
     return value;
+  }
+
+  /**
+   * Resolves the @Transform metadatas for (target, key) after version/group
+   * filtering, memoized for this executor. The selection depends only on
+   * (target, key) since the options are fixed per operation.
+   */
+  private getTransformMetadatas(target: Function, key: string): TransformMetadata[] {
+    let byKey = this._transformMetadatasCache.get(target);
+    if (byKey) {
+      const cached = byKey.get(key);
+      if (cached) return cached;
+    } else {
+      byKey = new Map<string, TransformMetadata[]>();
+      this._transformMetadatasCache.set(target, byKey);
+    }
+
+    let metadatas = defaultMetadataStorage.findTransformMetadatas(target, key, this.transformationType);
+    // Only the non-empty case needs version/group filtering (each filter allocates).
+    if (metadatas.length > 0) {
+      if (this.options.version !== undefined) {
+        metadatas = metadatas.filter(metadata => {
+          if (!metadata.options) return true;
+          return this.checkVersion(metadata.options.since, metadata.options.until);
+        });
+      }
+      if (this.options.groups && this.options.groups.length) {
+        metadatas = metadatas.filter(metadata => {
+          if (!metadata.options) return true;
+          return this.checkGroups(metadata.options.groups);
+        });
+      } else {
+        metadatas = metadatas.filter(metadata => {
+          return !metadata.options || !metadata.options.groups || !metadata.options.groups.length;
+        });
+      }
+    }
+
+    byKey.set(key, metadatas);
+    return metadatas;
   }
 
   // preventing circular references
   private isCircular(object: Record<string, any>): boolean {
     return this.recursionStack.has(object);
-  }
-
-  private getReflectedType(target: Function, propertyName: string): Function | undefined {
-    if (!target) return undefined;
-    const meta = defaultMetadataStorage.findTypeMetadata(target, propertyName);
-    return meta ? meta.reflectedType : undefined;
   }
 
   private getKeys(target: Function, object: Record<string, any>, isMap: boolean): string[] {
@@ -433,6 +564,10 @@ export class TransformOperationExecutor {
 
     // get all keys that need to expose
     let keys: any[] = [];
+    // Object.keys / Map keys are already unique, and every filter pass below
+    // preserves uniqueness — so a final dedup is only required once we merge in
+    // metadata-derived property lists. Track that to skip it in the common case.
+    let needsDedup = false;
     if (strategy === 'exposeAll' || isMap) {
       if (object instanceof Map) {
         keys = Array.from(object.keys());
@@ -454,25 +589,29 @@ export class TransformOperationExecutor {
       const exposedProperties = defaultMetadataStorage.getExposedProperties(target, this.transformationType);
       const excludedProperties = defaultMetadataStorage.getExcludedProperties(target, this.transformationType);
       keys = [...exposedProperties, ...excludedProperties];
+      needsDedup = true;
     }
 
     if (!this.options.ignoreDecorators && target) {
-      // add all exposed to list of keys
-      let exposedProperties = defaultMetadataStorage.getExposedProperties(target, this.transformationType);
-      if (this.transformationType === TransformationType.PLAIN_TO_CLASS) {
-        exposedProperties = exposedProperties.map(key => {
-          const exposeMetadata = defaultMetadataStorage.findExposeMetadata(target, key);
-          if (exposeMetadata && exposeMetadata.options && exposeMetadata.options.name) {
-            return exposeMetadata.options.name;
-          }
-
-          return key;
-        });
-      }
+      // add all exposed to list of keys. For PLAIN_TO_CLASS the @Expose({ name })
+      // rename is applied; both variants are memoized per target in the storage.
+      const exposedProperties =
+        this.transformationType === TransformationType.PLAIN_TO_CLASS
+          ? defaultMetadataStorage.getExposedPropertiesForPlainToClass(target)
+          : defaultMetadataStorage.getExposedProperties(target, this.transformationType);
       if (this.options.excludeExtraneousValues) {
         keys = exposedProperties;
-      } else {
-        keys = keys.concat(exposedProperties);
+        needsDedup = true;
+      } else if (exposedProperties.length > 0) {
+        // Merge object keys with exposed properties, deduped in a single pass.
+        // Preserves first-seen order (object keys before newly-added exposed ones,
+        // matching the old concat + dedup-first-wins) while avoiding a separate
+        // concat array and the final Set/Array round-trip — so no later dedup.
+        const merged = new Set<string>(keys);
+        for (let i = 0; i < exposedProperties.length; i++) {
+          merged.add(exposedProperties[i]);
+        }
+        keys = Array.from(merged);
       }
 
       // exclude excluded properties
@@ -502,46 +641,48 @@ export class TransformOperationExecutor {
           return this.checkGroups(exposeMetadata.options.groups);
         });
       } else {
-        keys = keys.filter(key => {
-          const exposeMetadata = defaultMetadataStorage.findExposeMetadata(target, key);
-          return (
-            !exposeMetadata ||
-            !exposeMetadata.options ||
-            !exposeMetadata.options.groups ||
-            !exposeMetadata.options.groups.length
-          );
-        });
+        // No groups requested: drop properties restricted to a group. The set of
+        // grouped property names is memoized per target, so when a class has none
+        // (the common case) we skip the filtering pass — and its allocation — entirely.
+        const groupedProperties = defaultMetadataStorage.getGroupedPropertyNames(target);
+        if (groupedProperties.size > 0) {
+          keys = keys.filter(key => !groupedProperties.has(key));
+        }
       }
     }
 
     // exclude prefixed properties
     if (this.options.excludePrefixes && this.options.excludePrefixes.length) {
+      const excludePrefixes = this.options.excludePrefixes;
       keys = keys.filter(key =>
-        this.options.excludePrefixes.every(prefix => {
+        excludePrefixes.every(prefix => {
           return key.substr(0, prefix.length) !== prefix;
         })
       );
     }
 
-    // make sure we have unique keys
-    keys = keys.filter((key, index, self) => {
-      return self.indexOf(key) === index;
-    });
+    // make sure we have unique keys — only when metadata-derived lists were merged
+    // in above. Set preserves first-seen order; O(n) vs the old O(n²) indexOf filter.
+    if (needsDedup) {
+      keys = Array.from(new Set(keys));
+    }
 
     return keys;
   }
 
-  private checkVersion(since: number, until: number): boolean {
+  private checkVersion(since?: number, until?: number): boolean {
+    const version = this.options.version;
     let decision = true;
-    if (decision && since) decision = this.options.version >= since;
-    if (decision && until) decision = this.options.version < until;
+    if (decision && since) decision = version !== undefined && version >= since;
+    if (decision && until) decision = version !== undefined && version < until;
 
     return decision;
   }
 
-  private checkGroups(groups: string[]): boolean {
+  private checkGroups(groups?: string[]): boolean {
     if (!groups) return true;
 
-    return this.options.groups.some(optionGroup => groups.includes(optionGroup));
+    const optionGroups = this.options.groups;
+    return optionGroups !== undefined && optionGroups.some(optionGroup => groups.includes(optionGroup));
   }
 }
