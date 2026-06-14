@@ -1,0 +1,14 @@
+
+class-transformer benchmark  (N=1000, samples=12, node v23.6.0)
+----------------------------------------------------------------------------------------------
+scenario                                           ops/sec       ms/op   gc#   gc/Kop    gc ms
+----------------------------------------------------------------------------------------------
+plainToInstance  · flat   · 1000                     397.3       2.517   276   534.88     41.6
+instanceToPlain  · flat   · 1000                     381.1       2.624   435   489.86     77.6
+plainToInstance  · nested · 1000                     112.5       8.891   281  1951.39     91.3
+instanceToPlain  · nested · 1000                     130.5       7.665   444  1423.08    152.3
+instanceToInstance·nested · 1000                     134.8       7.420   260  1444.44     89.8
+plainToInstance  · excludeExtraneous+groups · 1000       542.0       1.845   348   414.29    179.4
+----------------------------------------------------------------------------------------------
+
+JSON [{"n":"plainToInstance  · flat   · 1000","ops":397,"gcK":534.88},{"n":"instanceToPlain  · flat   · 1000","ops":381,"gcK":489.86},{"n":"plainToInstance  · nested · 1000","ops":112,"gcK":1951.39},{"n":"instanceToPlain  · nested · 1000","ops":130,"gcK":1423.08},{"n":"instanceToInstance·nested · 1000","ops":135,"gcK":1444.44},{"n":"plainToInstance  · excludeExtraneous+groups · 1000","ops":542,"gcK":414.29}]
